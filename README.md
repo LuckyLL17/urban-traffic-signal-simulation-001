@@ -28,3 +28,28 @@ npm run dev
 - 疏散场景、封闭路口和上游拥堵外溢推演
 
 扩展接口：`/api/corridors`、`/api/priority-requests`、`/api/pedestrian-phase`、`/api/evacuation-scenarios`、`/api/simulations/:id/emissions`。
+
+## 拥堵告警模块
+
+在不改变 `/api/detectors/events` 接口的前提下，检测器事件入库后旁路进入独立告警模块（`src/congestionAlerts.ts`）：
+
+- 按「路口 + 事件时间」滚动窗口（默认 60s）聚合流量/占有率/速度；窗口内检测器异常比例与异常检测器数量同时达标才判窗口异常。
+- 连续 2 个异常窗口创建告警，之后每个异常窗口更新同一告警；连续 2 个恢复窗口按事件时间自动解除。
+- 重复投递：`eventId` 或 `(检测器, 时间, 指标)` 内容指纹去重。
+- 乱序事件：在 watermark 允许迟到范围内（默认 120s）按事件时间落窗并重放状态机，自动解除的告警可被迟到异常重开；超时迟到事件只存档。
+- 跨窗口：告警记录全部异常窗口及峰值占有率/最低速度；无数据窗口打断连续计数。
+- 与手工事故 `/api/incidents` 独立存储，仅通过 `linkedIncidentIds`/`incidentRelated` 关联，不互相转换；人工解除后不再自动重开。
+
+接口：
+
+- `POST /api/detectors`：注册检测器与路口、期望流量（也支持 `J-01:D3` 前缀自动归属）
+- `GET /api/congestion/alerts?intersectionId=&status=`、`GET /api/congestion/alerts/:id`
+- `POST /api/congestion/alerts/:id/acknowledge`、`POST /api/congestion/alerts/:id/resolve`
+- `GET /api/congestion/windows?intersectionId=`：窗口级诊断
+- `GET/PUT /api/congestion/config`：查看/调整窗口长度、连续次数与各阈值
+
+验证正常流量、突发拥堵、恢复、多检测器同时异常、重复/乱序/跨窗口及手工事故区分：
+
+```bash
+npm run verify:congestion
+```

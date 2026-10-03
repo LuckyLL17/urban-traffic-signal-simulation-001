@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import { randomUUID } from 'node:crypto';
+import { createCongestionAlertService } from './congestionAlerts.js';
 
 type Phase={id:string;green:number;yellow:number;red:number}; type Intersection={id:string;name:string;phases:Phase[];cycle:number;queues:Record<string,number>;capacity:number;offset?:number};
 const app=Fastify({logger:true}); const now=()=>new Date().toISOString();
@@ -10,6 +11,10 @@ const intersections:Intersection[]=[
 ];
 const detectors:any[]=[];const incidents:any[]=[];const plans:any[]=[];const runs:any[]=[];const audit:any[]=[];
 const log=(action:string,payload:any)=>audit.push({id:randomUUID(),time:now(),action,payload});
+// 独立拥堵告警模块：不改变检测器事件接口，仅在事件入库后旁路消费
+const congestionAlerts=createCongestionAlertService();
+congestionAlerts.bindIntersections(intersections.map(j=>j.id));
+congestionAlerts.setIncidentProvider(id=>incidents.filter(x=>x.status==='active'&&x.intersectionId===id));
 function simulate(input:any){
  let totalDelay=0,maxQueue=0,spillbacks=0; const snapshots:any[]=[]; const horizon=Number(input.horizon||900); const demand=input.demand||{};
  const queues:Record<string,Record<string,number>>=Object.fromEntries(intersections.map(j=>[j.id,{...j.queues}]));
@@ -25,7 +30,7 @@ function simulate(input:any){
 }
 app.get('/health',async()=>({ok:true,service:'urban-traffic-signal-simulation',time:now()}));
 app.get('/api/network/state',async()=>({at:now(),intersections,incidents,detectors,metrics:{averageSpeed:31.4,totalQueue:intersections.reduce((s,j)=>s+Object.values(j.queues).reduce((a,b)=>a+Number(b),0),0)}}));
-app.post('/api/detectors/events',async(req:any,res)=>{const b=req.body as any;if(!b.detectorId||b.flow==null)return res.code(400).send({error:'detectorId 和 flow 必填'});const e={id:randomUUID(),time:b.time||now(),detectorId:b.detectorId,flow:Number(b.flow),occupancy:Number(b.occupancy||0),speed:Number(b.speed||0)};detectors.push(e);return e;});
+app.post('/api/detectors/events',async(req:any,res)=>{const b=req.body as any;if(!b.detectorId||b.flow==null)return res.code(400).send({error:'detectorId 和 flow 必填'});const e={id:randomUUID(),time:b.time||now(),detectorId:b.detectorId,flow:Number(b.flow),occupancy:Number(b.occupancy||0),speed:Number(b.speed||0)};detectors.push(e);congestionAlerts.ingest({eventId:b.eventId,detectorId:e.detectorId,intersectionId:b.intersectionId,time:e.time,flow:e.flow,occupancy:e.occupancy,speed:e.speed});return e;});
 app.post('/api/incidents',async(req:any,res)=>{const b=req.body as any;if(!b.intersectionId||!b.type)return res.code(400).send({error:'intersectionId 和 type 必填'});const i={id:randomUUID(),intersectionId:b.intersectionId,type:b.type,lane:b.lane||'unknown',severity:b.severity||'medium',status:'active',startedAt:now(),estimatedClearMinutes:Number(b.estimatedClearMinutes||20)};incidents.push(i);log('incident.open',i);return i;});
 app.post('/api/incidents/:id/clear',async(req:any,res)=>{const i=incidents.find(x=>x.id===(req.params as any).id);if(!i)return res.code(404).send({error:'incident not found'});i.status='cleared';i.clearedAt=now();return i;});
 app.post('/api/plans',async(req:any,res)=>{const b=req.body as any;if(!b.name||!b.changes)return res.code(400).send({error:'name 和 changes 必填'});const p={id:randomUUID(),name:b.name,basePlan:intersections.map(j=>({id:j.id,cycle:j.cycle,phases:j.phases})),changes:b.changes,priority:b.priority||'normal',status:'draft',createdAt:now()};plans.push(p);return p;});
@@ -54,5 +59,16 @@ app.post('/api/pedestrian-phase',async(req:any,res)=>{const b=req.body as any;if
 app.post('/api/simulations/:id/emissions',async(req:any,res)=>{const r=runs.find(x=>x.id===(req.params as any).id);if(!r)return res.code(404).send({error:'simulation not found'});const vkt=Number((req.body as any)?.vehicleKm||12000);const stopPenalty=(r.candidate?.totalDelay??r.baseline.totalDelay)/Math.max(1,r.baseline.horizon);return{simulationId:r.id,vehicleKm:vkt,co2Kg:Number((vkt*(.142+stopPenalty*.0008)).toFixed(2)),noxGrams:Number((vkt*(.32+stopPenalty*.0015)).toFixed(2)),idleHours:Number((stopPenalty*vkt/3600).toFixed(2)),method:'speed-delay surrogate model'};});
 app.post('/api/evacuation-scenarios',async(req:any)=>{const b=req.body as any;const blocked=(b.blockedIntersections||[]) as string[];const original=incidents.length;for(const id of blocked)incidents.push({id:randomUUID(),intersectionId:id,type:'evacuation-block',severity:'high',status:'active',startedAt:now()});const result=simulate({horizon:b.horizon||1800,demand:b.demand});incidents.splice(original);return{id:randomUUID(),type:'evacuation',blockedIntersections:blocked,result,recommendation:result.spillbacks>3?'open reversible lanes and meter upstream inflow':'maintain coordinated offsets'};});
 app.get('/api/priority-requests',async()=>priorityRequests);
+
+// 独立拥堵告警模块：检测器注册、告警查询/处置、窗口诊断与阈值配置
+app.post('/api/detectors',async(req:any,res)=>{const b=req.body as any;if(!b.detectorId||!b.intersectionId)return res.code(400).send({error:'detectorId 和 intersectionId 必填'});if(!intersections.find(x=>x.id===b.intersectionId))return res.code(404).send({error:'intersection not found'});return congestionAlerts.registerDetector({detectorId:b.detectorId,intersectionId:b.intersectionId,expectedFlow:b.expectedFlow});});
+app.get('/api/detectors/registry',async()=>congestionAlerts.listDetectors());
+app.get('/api/congestion/alerts',async(req:any)=>congestionAlerts.listAlerts((req.query as any)||{}));
+app.get('/api/congestion/alerts/:id',async(req:any,res)=>{const a=congestionAlerts.getAlert((req.params as any).id);if(!a)return res.code(404).send({error:'alert not found'});return a;});
+app.post('/api/congestion/alerts/:id/acknowledge',async(req:any,res)=>{const b=(req.body as any)||{};const a=congestionAlerts.acknowledgeAlert((req.params as any).id,b.by||'operator',b.note);if(!a)return res.code(404).send({error:'alert not found'});return a;});
+app.post('/api/congestion/alerts/:id/resolve',async(req:any,res)=>{const b=(req.body as any)||{};const a=congestionAlerts.closeAlert((req.params as any).id,b.by||'operator',b.note);if(!a)return res.code(404).send({error:'alert not found'});return a;});
+app.get('/api/congestion/windows',async(req:any)=>congestionAlerts.listWindows((req.query as any)?.intersectionId));
+app.get('/api/congestion/config',async()=>congestionAlerts.getConfig());
+app.put('/api/congestion/config',async(req:any,res)=>{try{return congestionAlerts.updateConfig((req.body as any)||{});}catch(err:any){return res.code(400).send({error:err.message});}});
 
 app.listen({port:Number(process.env.PORT||6302),host:'127.0.0.1'}).catch(err=>{app.log.error(err);process.exit(1)});
